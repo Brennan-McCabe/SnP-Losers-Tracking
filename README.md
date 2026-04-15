@@ -25,7 +25,7 @@ Results of initial testing:
 
 Breaking down the data:
 
-First, let's acknowledge the -1 year alpha. +12.36 is an obvious outlier and it can be caused by a few different reasons. The top candidate is the survivorship bias. By excluding all companies that were de-listed, there's an inherent bias towards companies that are healthy, but dropped off of the S&P for various reasons.
+First, let's acknowledge the -1 year alpha. +12.36 is an obvious outlier and it can be caused by a few different reasons. The top candidate is the survivorship bias. By excluding all companies that were de-listed, there's an inherent bias towards companies that are healthy, but dropped off of the S&P for various reasons. I suspect running the numbers with the full data would show a deeply negative correlation. If you magically knew the stocks that were going to be removed from the S&P, but would survive long-term following their removal and bought them a year in advance of said removal, the return for that batch would be on average 12.4% above the S&P return. The other pre-cognitive returns are all negative even with the bias in place.
 
 The thirty day holding period stands out as the most actionable, but let's keep the survivorship bias in mind before trading on this. 
 
