@@ -4,12 +4,21 @@ import requests
 import yfinance as yf
 from datetime import timedelta, date
 from io import StringIO
-import contextlib
-import os
 import warnings
 import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
+import math
+import numpy as np
+from scipy import stats
+import os
+import pickle
+import time
 
 warnings.filterwarnings('ignore')
+logging.getLogger('yfinance').setLevel(logging.CRITICAL)
+
+CACHE_FILE = "sp500_pricing_cache.pkl"
 
 # --- 1. THE SCRAPER ---
 def scrape_sp500_deletions_polars():
@@ -41,41 +50,93 @@ def scrape_sp500_deletions_polars():
     )
     return deletions
 
-# --- 2. THE EVENT STUDY ENGINE ---
+# --- 2. THE DATA INGESTION & CACHING ENGINE ---
+def fetch_and_cache_data(events, hold_periods):
+    """Downloads data with aggressive retries and saves it locally."""
+    if os.path.exists(CACHE_FILE):
+        print("Loading pricing data from local cache... (Guarantees consistency)")
+        with open(CACHE_FILE, 'rb') as f:
+            return pickle.load(f)
+            
+    print(f"No local cache found. Downloading data for {len(events)} deletions (This will only happen once)...")
+    
+    data_cache = {}
+    
+    # Download Benchmark
+    print("Fetching SPY benchmark...")
+    for attempt in range(3):
+        try:
+            spy_global = yf.download('SPY', start='2000-01-01', end=date.today() + timedelta(days=1), progress=False)
+            if not spy_global.empty:
+                data_cache['SPY'] = spy_global
+                break
+        except Exception:
+            time.sleep(1)
+            
+    if 'SPY' not in data_cache:
+        raise ConnectionError("Failed to download SPY benchmark after 3 attempts.")
+
+    # Isolated worker with retry logic
+    def download_stock(event):
+        ticker = event['Ticker']
+        event_date = event['Date']
+        max_hold = max(hold_periods)
+        min_hold = min(hold_periods)
+        start_date = event_date - timedelta(days=abs(min_hold) + 30)
+        end_date = event_date + timedelta(days=max_hold + 30)
+        
+        for attempt in range(3): # Aggressive retry to beat Yahoo's rate limits
+            try:
+                stock = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                if not stock.empty:
+                    return ticker, stock
+                break # If successful but empty, it's genuinely delisted/missing, don't retry
+            except Exception:
+                time.sleep(1) # Wait 1 second before hammering the API again
+        return ticker, None
+
+    with ThreadPoolExecutor(max_workers=10) as executor: # Reduced threads to 10 for stability
+        future_to_ticker = {executor.submit(download_stock, event): event['Ticker'] for event in events}
+        for future in as_completed(future_to_ticker):
+            ticker, stock_df = future.result()
+            if stock_df is not None:
+                data_cache[ticker] = stock_df
+
+    # Save to disk
+    with open(CACHE_FILE, 'wb') as f:
+        pickle.dump(data_cache, f)
+        
+    print(f"Data permanently cached! Successfully locked in {len(data_cache)-1} tickers.")
+    return data_cache
+
+# --- 3. THE MATH ENGINE (Runs off the Local Cache) ---
 def run_deletion_event_study(deletions_df: pl.DataFrame):
     hold_periods = [-365, -30, -10, -5, 0, 5, 10, 30, 365, 1825]
-    
-    results = []
     events = deletions_df.to_dicts()
+    results = []
     
-    excluded_count = 0
+    # Load frozen data
+    data_cache = fetch_and_cache_data(events, hold_periods)
+    
+    spy_global = data_cache['SPY']
+    if isinstance(spy_global.columns, pd.MultiIndex):
+        spy_col = 'Adj Close' if 'Adj Close' in spy_global.columns.get_level_values(0) else 'Close'
+    else:
+        spy_col = 'Adj Close' if 'Adj Close' in spy_global.columns else 'Close'
+    spy_adj_global = spy_global[spy_col].squeeze().dropna()
+
     included_count = 0
-    
-    print(f"Starting parameter sweep for {len(events)} deletions. Muting API warnings...")
+    excluded_count = 0
     
     for event in events:
         ticker = event['Ticker']
-        event_date = event['Date'] 
+        event_date = event['Date']
         
-        max_hold = max(hold_periods)
-        min_hold = min(hold_periods)
-        
-        start_date = event_date - timedelta(days=abs(min_hold) + 30)
-        end_date = event_date + timedelta(days=max_hold + 30) 
-        
-        with open(os.devnull, 'w') as devnull:
-            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                try:
-                    stock = yf.download(ticker, start=start_date, end=end_date, progress=False)
-                    spy = yf.download('SPY', start=start_date, end=end_date, progress=False)
-                except Exception:
-                    stock = pd.DataFrame()
-                    spy = pd.DataFrame()
-        
-        if stock.empty or spy.empty:
+        if ticker not in data_cache:
             excluded_count += 1
             continue
             
+        stock = data_cache[ticker].dropna(how='all')
         valid_dates = stock.index[stock.index.date >= event_date]
         if len(valid_dates) == 0:
             excluded_count += 1
@@ -86,10 +147,7 @@ def run_deletion_event_study(deletions_df: pl.DataFrame):
         
         for hold in hold_periods:
             if hold == 0:
-                results.append({
-                    "Ticker": ticker, "Company": event['Company'], "Event_Date": t_zero.date(),
-                    "Hold_Days": 0, "Stock_Return": 0.0, "SPY_Return": 0.0, "Alpha": 0.0
-                })
+                results.append({"Ticker": ticker, "Hold_Days": 0, "Stock_Return": 0.0, "SPY_Return": 0.0, "Alpha": 0.0})
                 has_valid_period = True
                 continue
                 
@@ -100,83 +158,65 @@ def run_deletion_event_study(deletions_df: pl.DataFrame):
                 if len(end_dates) == 0: continue
                 t_n = end_dates[-1]
                 if (target_end - t_n).days > 14: continue 
-                
-                start_calc_date = t_zero
-                end_calc_date = t_n
+                start_calc_date, end_calc_date = t_zero, t_n
             else:
                 target_start = t_zero + timedelta(days=hold)
                 start_dates = stock.index[stock.index >= target_start]
                 if len(start_dates) == 0 or start_dates[0] > t_zero: continue
                 t_minus_n = start_dates[0]
-                
-                start_calc_date = t_minus_n
-                end_calc_date = t_zero
+                start_calc_date, end_calc_date = t_minus_n, t_zero
 
             try:
-                # Dynamically handle MultiIndex columns and fallback to 'Close' if 'Adj Close' is missing
-                s_col = 'Adj Close' if 'Adj Close' in stock.columns.get_level_values(0) else 'Close'
-                spy_col = 'Adj Close' if 'Adj Close' in spy.columns.get_level_values(0) else 'Close'
+                if isinstance(stock.columns, pd.MultiIndex):
+                    s_col = 'Adj Close' if 'Adj Close' in stock.columns.get_level_values(0) else 'Close'
+                else:
+                    s_col = 'Adj Close' if 'Adj Close' in stock.columns else 'Close'
+                
+                stock_adj = stock[s_col].squeeze().dropna()
+                
+                def get_price(price_series, target_date):
+                    valid_idx = price_series.index[price_series.index <= target_date]
+                    if len(valid_idx) == 0: raise ValueError("No valid date found")
+                    val = price_series.loc[valid_idx[-1]]
+                    if isinstance(val, (pd.Series, pd.DataFrame)): val = float(val.iloc[0])
+                    else: val = float(val)
+                    if pd.isna(val) or math.isnan(val): raise ValueError("Price is NaN")
+                    return val
 
-                def safe_float(val):
-                    if isinstance(val, (pd.Series, pd.DataFrame)):
-                        return float(val.iloc[0])
-                    return float(val)
-
-                # Extract Stock Prices
-                s_p0 = safe_float(stock[s_col].loc[start_calc_date])
-                s_pn = safe_float(stock[s_col].loc[end_calc_date])
+                s_p0 = get_price(stock_adj, start_calc_date)
+                s_pn = get_price(stock_adj, end_calc_date)
+                spy_p0 = get_price(spy_adj_global, start_calc_date)
+                spy_pn = get_price(spy_adj_global, end_calc_date)
                 
-                # Extract SPY Prices (finding closest prior dates to handle any calendar mismatches)
-                spy_starts = spy.index[spy.index <= start_calc_date]
-                spy_ends = spy.index[spy.index <= end_calc_date]
-                
-                if len(spy_starts) == 0 or len(spy_ends) == 0:
-                    continue
-                    
-                spy_p0 = safe_float(spy[spy_col].loc[spy_starts[-1]])
-                spy_pn = safe_float(spy[spy_col].loc[spy_ends[-1]])
-                
-                # Math
                 stock_ret = (s_pn - s_p0) / s_p0
                 spy_ret = (spy_pn - spy_p0) / spy_p0
                 
-                results.append({
-                    "Ticker": ticker, "Company": event['Company'], "Event_Date": t_zero.date(),
-                    "Hold_Days": hold, "Stock_Return": stock_ret, "SPY_Return": spy_ret, "Alpha": stock_ret - spy_ret
-                })
+                results.append({"Ticker": ticker, "Hold_Days": hold, "Stock_Return": stock_ret, "SPY_Return": spy_ret, "Alpha": stock_ret - spy_ret})
                 has_valid_period = True
-                
-            except Exception as e:
-                # If a true math or index error happens, it will quietly skip this specific hold window
+            except Exception:
                 pass
                 
         if has_valid_period: included_count += 1
         else: excluded_count += 1
 
-    print(f"\n{excluded_count} stocks excluded due to missing data, {included_count} stocks used.")
+    print(f"\n{excluded_count} stocks excluded due to missing historical data, {included_count} stocks used.")
     return pl.DataFrame(results)
 
-# --- 3. THE VISUALIZATION BLOCK ---
+# --- 4. THE VISUALIZATION BLOCK ---
 def plot_event_study(study_results: pl.DataFrame):
-    agg_df = (
-        study_results.group_by("Hold_Days")
-        .agg([
-            pl.col("Stock_Return").mean().alias("Avg_Stock_Return"),
-            pl.col("SPY_Return").mean().alias("Avg_SPY_Return"),
-            pl.col("Alpha").mean().alias("Avg_Alpha")
-        ])
-        .sort("Hold_Days")
-    ).to_pandas()
+    agg_df = study_results.group_by("Hold_Days").agg([
+        pl.col("Stock_Return").mean().alias("Avg_Stock_Return"),
+        pl.col("SPY_Return").mean().alias("Avg_SPY_Return"),
+        pl.col("Alpha").mean().alias("Avg_Alpha")
+    ]).sort("Hold_Days").to_pandas()
 
     agg_df['Avg_Stock_Return'] *= 100
     agg_df['Avg_SPY_Return'] *= 100
     agg_df['Avg_Alpha'] *= 100
 
     plt.figure(figsize=(12, 7))
-    
     plt.plot(agg_df['Hold_Days'], agg_df['Avg_Stock_Return'], marker='o', linewidth=2, color='#1f77b4', label='Surviving Stocks (Avg Return %)')
     plt.plot(agg_df['Hold_Days'], agg_df['Avg_SPY_Return'], marker='s', linewidth=2, color='#2ca02c', label='S&P 500 Benchmark (Avg Return %)')
-    
     plt.bar(agg_df['Hold_Days'], agg_df['Avg_Alpha'], width=15, color='gray', alpha=0.3, label='Outperformance / Alpha (%)')
 
     plt.axvline(x=0, color='red', linestyle='--', linewidth=1.5, label='Event: S&P 500 Deletion (Day 0)')
@@ -185,47 +225,51 @@ def plot_event_study(study_results: pl.DataFrame):
     plt.title('S&P 500 Index Deletion Effect (Total Return): Pre & Post Performance', fontsize=14, fontweight='bold')
     plt.xlabel('Days Relative to Effective Deletion Date', fontsize=12)
     plt.ylabel('Cumulative Return (%)', fontsize=12)
-    
     plt.xscale('symlog', linthresh=35) 
-    
-    ticks = [-365, -30, -10, 0, 10, 30, 365, 1825]
-    labels = ['-1 Yr', '-30d', '-10d', 'Day 0', '+10d', '+30d', '+1 Yr', '+5 Yrs']
-    plt.xticks(ticks, labels)
-
+    plt.xticks([-365, -30, -10, 0, 10, 30, 365, 1825], ['-1 Yr', '-30d', '-10d', 'Day 0', '+10d', '+30d', '+1 Yr', '+5 Yrs'])
     plt.grid(True, linestyle=':', alpha=0.7)
     plt.legend(loc='best')
     plt.tight_layout()
-    
-    # Save the plot as a high-resolution PNG in the same folder as your script
     plt.savefig('sp500_deletion_effect.png', dpi=300, bbox_inches='tight')
-    
     plt.show()
-# --- 4. THE EXECUTION BLOCK ---
+
+# --- 5. THE EXECUTION BLOCK ---
 if __name__ == "__main__":
     print("Step 1: Scraping historical changes...")
     deletions_pl = scrape_sp500_deletions_polars() 
     
-    print("Step 2: Processing pricing horizons...")
+    print("Step 2: Securing pricing horizons (with caching)...")
     study_results = run_deletion_event_study(deletions_pl)
     
     if not study_results.is_empty():
-        print("\n=== S&P 500 Index Deletion Stats (Total Return) ===")
-        hold_periods = [-365, -30, -10, -5, 0, 5, 10, 30, 365, 1825]
-        labels = ["-1 Year", "-30 Days", "-10 Days", "-5 Days", "Day 0", "+5 Days", "+10 Days", "+30 Days", "+1 Year", "+5 Years"]
+        print("\n=== S&P 500 Index Deletion Stats: Statistical Analysis ===")
+        print(f"{'Period':<10} | {'N':<4} | {'Avg Alpha':<10} | {'Std Dev':<9} | {'Sharpe':<7} | {'P-Value':<8} | {'Sig?'}")
+        print("-" * 70)
         
-        # Check if we have more than just the Day 0 entries
-        if study_results.height <= len(deletions_pl):
-             print("Error: The study only generated Day 0 baselines. No pricing data was successfully extracted.")
-        else:
-            for hold, label in zip(hold_periods, labels):
-                period_df = study_results.filter(pl.col("Hold_Days") == hold)
-                if not period_df.is_empty() and hold != 0:
-                    count = period_df.height
-                    avg_alpha = period_df.select(pl.col("Alpha").mean()).item()
-                    print(f"[{label.rjust(8)}] N={count} | Avg Alpha: {avg_alpha:+.2%}")
+        hold_periods = [-365, -30, -10, -5, 5, 10, 30, 365, 1825]
+        labels = ["-1 Year", "-30 Days", "-10 Days", "-5 Days", "+5 Days", "+10 Days", "+30 Days", "+1 Year", "+5 Years"]
+        
+        for hold, label in zip(hold_periods, labels):
+            period_df = study_results.filter(pl.col("Hold_Days") == hold)
+            if not period_df.is_empty():
+                alphas = period_df.select("Alpha").to_numpy().flatten()
+                n_count = len(alphas)
+                
+                if n_count > 1:
+                    avg_alpha = np.mean(alphas)
+                    std_dev = np.std(alphas, ddof=1)
+                    t_stat, p_value = stats.ttest_1samp(alphas, 0.0)
+                    sharpe = avg_alpha / std_dev if std_dev != 0 else 0
                     
-            print("\nStep 3: Generating Plot...")
-            plot_event_study(study_results)
-            
+                    if p_value < 0.01: sig = "***"
+                    elif p_value < 0.05: sig = "**"
+                    elif p_value < 0.10: sig = "*"
+                    else: sig = ""
+                    
+                    print(f"[{label.rjust(8)}] | {n_count:<4} | {avg_alpha:>+8.2%} | {std_dev:>8.2%} | {sharpe:>+6.2f} | {p_value:>6.3f}   | {sig}")
+                
+        print("\n* Significance Levels: *** (p<0.01), ** (p<0.05), * (p<0.10)")
+        print("\nStep 3: Generating Plot...")
+        plot_event_study(study_results)
     else:
         print("\nNo valid pricing data found.")
