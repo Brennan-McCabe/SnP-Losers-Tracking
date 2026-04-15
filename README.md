@@ -11,23 +11,17 @@ Results of initial testing:
 
 === S&P 500 Index Deletion Stats (Total Return) ===
 
-[ -1 Year] N=154 | Avg Alpha: +12.36%
-
-[-30 Days] N=154 | Avg Alpha: -1.78%
-
-[-10 Days] N=154 | Avg Alpha: -2.11%
-
-[ -5 Days] N=154 | Avg Alpha: -0.73%
-
-[ +5 Days] N=154 | Avg Alpha: +0.60%
-
-[+10 Days] N=154 | Avg Alpha: +0.64%
-
-[+30 Days] N=150 | Avg Alpha: +3.89%
-
-[ +1 Year] N=139 | Avg Alpha: +2.99%
-
-[+5 Years] N=86 | Avg Alpha: -9.20%
+| Holding Period | Sample Size (N) | Average Alpha vs SPY |
+| :--- | :--- | :--- |
+| **-1 Year** | 154 | +12.36% |
+| **-30 Days** | 154 | -1.78% |
+| **-10 Days** | 154 | -2.11% |
+| **-5 Days** | 154 | -0.73% |
+| **+5 Days** | 154 | +0.60% |
+| **+10 Days** | 154 | +0.64% |
+| **+30 Days** | 150 | +3.89% |
+| **+1 Year** | 139 | +2.99% |
+| **+5 Years** | 86 | -9.20% |
 
 Breaking down the data:
 
@@ -36,3 +30,23 @@ First, let's acknowledge the -1 year alpha. +12.36 is an obvious outlier and it 
 The thirty day holding period stands out as the most actionable, but let's keep the survivorship bias in mind before trading on this. 
 
 The thesis of this project and the impetus was that the 5 year holding period outperformed SPY by 5%, but the end result is not consistent with that. My calculated Alpha over a 5 year period is -9.2% and of course that's before considering that 219 of the 373 possible stocks were de-listed and excluded from the calculations. There is a possibility that the de-listed stocks were acquired, or went private and caused a boon for the investors, but the reasonable assumption is that a company trending downwards that was later de-listed did so because it was underperforming the market, not overperforming. I'll need access to higher quality data to dig further into that.
+
+Technicals:
+
+Python stack:
+
+Polars, Pandas, yfinance, contextlib, matplotlib.pyplot
+
+data sources:
+
+https://en.wikipedia.org/wiki/List_of_S%26P_500_companies
+
+Yahoo Finance
+
+Next:
+
+Without higher quality data on de-listed companies, the results are inconclusive, but lean against the proposed 5% alpha. I can reach out to RBS to see if they'll grant me access.
+
+I'd like to take a closer look at that 30 day holding period and see what the more granular data has to say.
+
+If I could look into the fundamentals of the companies that were removed from the S&P and find correlations between those that did well following removal or those that didn't, the results might be more actionable.
