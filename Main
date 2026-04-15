@@ -1,0 +1,168 @@
+import polars as pl
+import pandas as pd
+import requests
+import yfinance as yf
+from datetime import timedelta, date
+from io import StringIO
+import contextlib
+import os
+import sys
+import warnings
+
+# Suppress pandas future warnings and yfinance noise
+warnings.filterwarnings('ignore')
+
+# --- 1. THE SCRAPER ---
+def scrape_sp500_deletions_polars():
+    url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+    headers = {"User-Agent": "Mozilla/5.0"}
+    
+    response = requests.get(url, headers=headers)
+    raw_tables = pd.read_html(StringIO(response.text))
+    changes_df = raw_tables[1]
+    
+    if isinstance(changes_df.columns, pd.MultiIndex):
+        changes_df.columns = ['_'.join(col).strip() for col in changes_df.columns]
+        
+    date_col = [c for c in changes_df.columns if 'Date' in c][0]
+    ticker_col = [c for c in changes_df.columns if 'Removed' in c and 'Ticker' in c][0]
+    company_col = [c for c in changes_df.columns if 'Removed' in c and 'Security' in c][0]
+    
+    changes_df[date_col] = pd.to_datetime(changes_df[date_col], errors='coerce')
+    df = pl.from_pandas(changes_df)
+    
+    deletions = (
+        df.select([
+            pl.col(date_col).cast(pl.Date).alias("Date"),
+            pl.col(ticker_col).alias("Ticker"),
+            pl.col(company_col).alias("Company")
+        ])
+        .drop_nulls(subset=["Ticker"])
+        .sort("Date", descending=True)
+    )
+    return deletions
+
+# --- 2. THE EVENT STUDY ENGINE ---
+def run_deletion_event_study(deletions_df: pl.DataFrame):
+    # The different holding horizons you want to test (1825 days = 5 calendar years)
+    hold_periods = [5, 10, 30, 1825]
+    
+    results = []
+    events = deletions_df.to_dicts()
+    
+    excluded_count = 0
+    included_count = 0
+    
+    print(f"Starting parameter sweep for {len(events)} deletions. Muting API warnings...")
+    
+    for event in events:
+        ticker = event['Ticker']
+        event_date = event['Date'] 
+        
+        # We only ping the API once per stock, pulling enough data for the longest hold period
+        max_hold = max(hold_periods)
+        start_date = event_date - timedelta(days=10)
+        end_date = event_date + timedelta(days=max_hold + 30) 
+        
+        # Use contextlib to route yfinance's hard-coded print statements into a black hole
+        with open(os.devnull, 'w') as devnull:
+            with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+                try:
+                    stock = yf.download(ticker, start=start_date, end=end_date, progress=False)
+                    spy = yf.download('SPY', start=start_date, end=end_date, progress=False)
+                except Exception:
+                    stock = pd.DataFrame()
+                    spy = pd.DataFrame()
+        
+        if stock.empty or spy.empty:
+            excluded_count += 1
+            continue
+            
+        valid_dates = stock.index[stock.index.date >= event_date]
+        if len(valid_dates) == 0:
+            excluded_count += 1
+            continue
+            
+        t_zero = valid_dates[0]
+        has_valid_period = False
+        
+        # Test each holding period for this specific stock
+        for hold in hold_periods:
+            target_end = t_zero + timedelta(days=hold)
+            
+            # Logic check: We cannot calculate a 5-year hold for a stock deleted in 2024.
+            if target_end.date() > date.today():
+                continue 
+                
+            end_dates = stock.index[stock.index <= target_end]
+            if len(end_dates) == 0:
+                continue
+                
+            t_n = end_dates[-1]
+            
+            # If the closest trading day is more than 14 days away from our target, 
+            # the stock likely de-listed before our holding period finished.
+            if (target_end - t_n).days > 14:
+                continue
+            
+            try:
+                # Extract scalar values robustly (handling differences in pandas/yfinance versions)
+                stock_p0 = float(stock['Close'].loc[t_zero].iloc[0]) if isinstance(stock['Close'], pd.DataFrame) else float(stock['Close'].loc[t_zero])
+                stock_pn = float(stock['Close'].loc[t_n].iloc[0]) if isinstance(stock['Close'], pd.DataFrame) else float(stock['Close'].loc[t_n])
+                
+                spy_p0 = float(spy['Close'].loc[t_zero].iloc[0]) if isinstance(spy['Close'], pd.DataFrame) else float(spy['Close'].loc[t_zero])
+                spy_pn = float(spy['Close'].loc[t_n].iloc[0]) if isinstance(spy['Close'], pd.DataFrame) else float(spy['Close'].loc[t_n])
+                
+                stock_ret = (stock_pn - stock_p0) / stock_p0
+                spy_ret = (spy_pn - spy_p0) / spy_p0
+                
+                period_label = "5 Years" if hold == 1825 else f"{hold} Days"
+                
+                results.append({
+                    "Ticker": ticker,
+                    "Company": event['Company'],
+                    "Event_Date": t_zero.date(),
+                    "Hold_Period": period_label,
+                    "Alpha": stock_ret - spy_ret
+                })
+                has_valid_period = True
+            except Exception:
+                pass
+                
+        # If the stock survived long enough to register at least one valid period, count it
+        if has_valid_period:
+            included_count += 1
+        else:
+            excluded_count += 1
+
+    # The clean output formatting you requested
+    print(f"\n{excluded_count} stocks excluded due to de-listing, {included_count} stocks used in calculations.")
+            
+    return pl.DataFrame(results)
+
+# --- 3. THE EXECUTION BLOCK ---
+if __name__ == "__main__":
+    print("Step 1: Scraping historical changes...")
+    deletions_pl = scrape_sp500_deletions_polars() 
+    
+    print("Step 2: Processing pricing horizons...")
+    study_results = run_deletion_event_study(deletions_pl)
+    
+    if not study_results.is_empty():
+        print("\n=== S&P 500 Index Deletion Outperformance (Alpha) ===")
+        
+        # Iterate through our specific hold periods to print the aggregated stats
+        for period in ["5 Days", "10 Days", "30 Days", "5 Years"]:
+            period_df = study_results.filter(pl.col("Hold_Period") == period)
+            
+            if not period_df.is_empty():
+                count = period_df.height
+                avg_alpha = period_df.select(pl.col("Alpha").mean()).item()
+                win_rate = period_df.filter(pl.col("Alpha") > 0).height / count
+                
+                print(f"\n[{period} Hold]")
+                print(f"Sample Size   : {count} valid events")
+                print(f"Average Alpha : {avg_alpha:.2%}")
+                print(f"Win Rate      : {win_rate:.2%}")
+    else:
+        print("\nNo valid pricing data found.")
