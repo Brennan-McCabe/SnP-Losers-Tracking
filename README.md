@@ -3,7 +3,7 @@ I read an article claiming that companies removed from the S&P500 outperform the
 
 To go about calculating this, I scraped S&P historical data from wikipedia and imported data from yfinance, cleaned the data in pandas, and ran everything through polars. Due to Wiki and Yahoo's handling of de-listed stocks, 158 of the 373 potential stocks were not factored into the calculations. It's possible to include the de-listed stocks, but it requires access to premium services. I have reached out to my university's business school to see about gaining that access.
 
-To get a real idea for the returns, I wanted data from before, during, and after the delisting to see the full trend. I accumulated data for t-1 year, t-30 days, t-10 days, t-5 days, t+5 days, t+10 days, t+30 days, t+1 year, and t+5 years for each of the still-listed stocks removed from the S&P to see what the results bore.
+To get a real idea for the returns, I wanted data from before, during, and after the removal to see the full trend. I accumulated data for t-1 year, t-30 days, t-10 days, t-5 days, t+5 days, t+10 days, t+30 days, t+1 year, and t+5 years for each of the still-listed stocks removed from the S&P to see what the results bore.
 
 To clarify, t-1 year means buying a stock 365 days before its removal date from the S&P 500 and holding it until the day of its removal. T+1 year would mean buying on the day of the removal and holding for 365 days.
 
